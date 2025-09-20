@@ -211,7 +211,7 @@ class SiameseRNN(nn.Module):
 
 
 
-def train_loop(model, train_loader, val_loader, epochs=5, lr=1e-3,
+def train_loop(model, train_loader, val_loader, epochs=EPOCHS, lr=LR,
                device="cuda" if torch.cuda.is_available() else "cpu",
                pad_id=0,
                ckpt_path="lstm_best.pt"):
@@ -287,8 +287,8 @@ hidden = ...
 num_layers = ...
 dropout = ...
 
-epochs = ...
-lr = ...
+EPOCHS = 20
+LR = 1e-3
 ckpt_path = 'rnn_best.pt'
 
 # ## 6) Train
