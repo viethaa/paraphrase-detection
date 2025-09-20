@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 import time
 
-torch.manual_seed(77)
+torch.manual_seed(777)
 
 if torch.cuda.is_available():
     device = torch.device("cuda")
