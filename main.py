@@ -13,6 +13,12 @@ import os
 import numpy as np
 from sklearn.model_selection import train_test_split
 
+# Check GPU availability for Colab
+print(f"CUDA available: {torch.cuda.is_available()}")
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+
 seed = 42
 os.environ["PYTHONHASHSEED"] = str(seed)
 random.seed(seed)
@@ -178,7 +184,9 @@ class MultiHeadAttention(nn.Module):
 
         if mask is not None:
             mask = mask.unsqueeze(1).unsqueeze(1)  # [batch_size, 1, 1, seq_len]
-            scores = scores.masked_fill(mask == 0, -1e9)
+            # Use a smaller negative value that works with float16
+            mask_value = torch.finfo(scores.dtype).min
+            scores = scores.masked_fill(mask == 0, mask_value)
 
         attention_weights = F.softmax(scores, dim=-1)
         attention_weights = self.dropout(attention_weights)
@@ -264,10 +272,12 @@ class BERTLikeModel(nn.Module):
             for _ in range(num_layers)
         ])
 
-        # Classification head
+        # Classification head with stronger regularization
         self.pooler = nn.Linear(d_model, d_model)
         self.classifier = nn.Sequential(
+            nn.Dropout(dropout * 2),  # Increased dropout for classification head
             nn.Linear(d_model, d_model // 2),
+            nn.LayerNorm(d_model // 2),  # Add layer norm
             nn.Dropout(dropout),
             nn.GELU(),
             nn.Linear(d_model // 2, num_classes)
@@ -324,23 +334,27 @@ class BERTLikeModel(nn.Module):
 def train_loop(model, train_loader, val_loader, epochs=10, lr=2e-5,
                device="cuda" if torch.cuda.is_available() else "cpu",
                ckpt_path="bert_best.pt",
-               warmup_steps=1000):
+               warmup_steps=200, patience=3):  # Reduced for Colab
 
     model.to(device)
+    print(f"Training on device: {device}")
 
     # AdamW optimizer with weight decay
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01, eps=1e-8)
 
-    # Learning rate scheduler with warmup
-    total_steps = len(train_loader) * epochs
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=lr, total_steps=total_steps,
-        pct_start=warmup_steps/total_steps, anneal_strategy='cos'
+    # Simpler scheduler for Colab
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=2, verbose=True
     )
 
     criterion = nn.BCEWithLogitsLoss()
 
     best_val_loss = float("inf")
+    patience_counter = 0
+
+    # Disable mixed precision for Colab stability
+    use_amp = False  # Set to False for Colab compatibility
+    scaler = torch.cuda.amp.GradScaler() if use_amp and device == 'cuda' else None
 
     for epoch in range(1, epochs + 1):
         # Training
@@ -351,7 +365,7 @@ def train_loop(model, train_loader, val_loader, epochs=10, lr=2e-5,
 
         progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}")
 
-        for batch in progress_bar:
+        for batch_idx, batch in enumerate(progress_bar):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             token_type_ids = batch['token_type_ids'].to(device)
@@ -359,28 +373,34 @@ def train_loop(model, train_loader, val_loader, epochs=10, lr=2e-5,
 
             optimizer.zero_grad()
 
+            # Standard training (no mixed precision for Colab)
             logits = model(input_ids, attention_mask, token_type_ids)
             loss = criterion(logits, labels)
-
             loss.backward()
 
             # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
             optimizer.step()
-            scheduler.step()
 
             total_loss += loss.item()
 
             # Calculate accuracy
-            predictions = torch.sigmoid(logits) > 0.5
-            correct_predictions += (predictions == labels).sum().item()
-            total_predictions += labels.size(0)
+            with torch.no_grad():
+                predictions = torch.sigmoid(logits) > 0.5
+                correct_predictions += (predictions == labels).sum().item()
+                total_predictions += labels.size(0)
 
-            progress_bar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'acc': f'{correct_predictions/total_predictions:.4f}'
-            })
+            # Update progress bar
+            if batch_idx % 50 == 0:  # Update every 50 batches
+                current_acc = correct_predictions / max(1, total_predictions)
+                progress_bar.set_postfix({
+                    'loss': f'{loss.item():.4f}',
+                    'acc': f'{current_acc:.4f}'
+                })
+
+            # Clear cache periodically for Colab
+            if batch_idx % 100 == 0 and device == 'cuda':
+                torch.cuda.empty_cache()
 
         avg_train_loss = total_loss / len(train_loader)
         train_accuracy = correct_predictions / total_predictions
@@ -410,37 +430,52 @@ def train_loop(model, train_loader, val_loader, epochs=10, lr=2e-5,
         avg_val_loss = val_loss / len(val_loader)
         val_accuracy = val_correct / val_total
 
+        # Step scheduler
+        scheduler.step(avg_val_loss)
+
         print(f"Epoch {epoch:02d} | "
               f"train_loss={avg_train_loss:.4f} train_acc={train_accuracy:.4f} | "
-              f"val_loss={avg_val_loss:.4f} val_acc={val_accuracy:.4f} | "
-              f"lr={scheduler.get_last_lr()[0]:.2e}")
+              f"val_loss={avg_val_loss:.4f} val_acc={val_accuracy:.4f}")
 
-        # Save best model
+        # Save best model and early stopping
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
+            patience_counter = 0
             torch.save(model.state_dict(), ckpt_path)
-            print(f"Saved new best model to {ckpt_path}")
+            print(f"✅ Saved new best model to {ckpt_path}")
+        else:
+            patience_counter += 1
+            print(f"⏳ No improvement for {patience_counter} epochs")
 
-# Create datasets and dataloaders
-train_dataset = BERTDataset(train_df, max_length=256)
-val_dataset = BERTDataset(val_df, max_length=256)
+            if patience_counter >= patience:
+                print(f"🛑 Early stopping after {patience} epochs without improvement")
+                break
 
+        # Clear cache after each epoch for Colab
+        if device == 'cuda':
+            torch.cuda.empty_cache()
+
+# Create datasets and dataloaders - Colab optimized
+train_dataset = BERTDataset(train_df, max_length=128)  # Reduced for Colab memory
+val_dataset = BERTDataset(val_df, max_length=128)
+
+# Optimized for Colab GPU memory
 train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True,
-                         collate_fn=bert_collate_fn, num_workers=4)
+                         collate_fn=bert_collate_fn, num_workers=0, pin_memory=False)
 val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False,
-                       collate_fn=bert_collate_fn, num_workers=4)
+                       collate_fn=bert_collate_fn, num_workers=0, pin_memory=False)
 
-# Model hyperparameters (optimized for performance vs computational cost)
-d_model = 512      # Hidden size
-num_heads = 8      # Number of attention heads
-num_layers = 6     # Number of transformer layers
-d_ff = 2048        # Feed forward dimension
-dropout = 0.1      # Dropout rate
-max_length = 256   # Maximum sequence length
+# Model hyperparameters (Colab optimized)
+d_model = 256      # Smaller for Colab memory
+num_heads = 4      # Fewer attention heads
+num_layers = 3     # Reduced layers for Colab
+d_ff = 1024        # Smaller feed forward
+dropout = 0.2      # Increased dropout for regularization
+max_length = 128   # Reduced sequence length for memory
 
 # Training hyperparameters
-epochs = 15
-lr = 2e-5         # Learning rate
+epochs = 10        # Reduced for Colab session limits
+lr = 3e-5         # Learning rate
 ckpt_path = 'bert_best.pt'
 
 # Initialize model
@@ -560,4 +595,4 @@ def infer_bert(csv_file, ckpt_path, vocab_to_id, device='cuda', batch_size=32,
     print(f"Saved {len(predictions)} predictions to {out_path}")
 
 # Run inference
-infer_bert('public_test.csv', ckpt_path, vocab_to_id)
+infer_bert('sample_data/public_test.csv', ckpt_path, vocab_to_id)
