@@ -4,5 +4,6 @@ torch
 torchvision
 torchaudio
 pandas
+tqdm
 
 #pip install -r requirements.txt
